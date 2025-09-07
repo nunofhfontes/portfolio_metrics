@@ -1,0 +1,24 @@
+{
+  "name": "portfolio_metrics",
+  "version": "2.0.0",
+  "description": "portfolio metrics calculation",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nunofhfontes/portfolio_metrics.git"
+  },
+  "author": "Nuno Fontes",
+  "license": "MIT",
+  "homepage": "https://github.com/nunofhfontes/portfolio_metrics#readme",
+  "dependencies": {
+    "dayjs": "^1.11.13",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "yahoo-finance2": "^3.17.0"
+  }
+}
