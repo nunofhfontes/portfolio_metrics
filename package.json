@@ -1,6 +1,6 @@
 {
   "name": "portfolio_metrics",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "portfolio metrics calculation",
   "type": "module",
   "private": true,
@@ -19,6 +19,6 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0",
-    "yahoo-finance2": "^3.17.0"
+    "undici": "^6.19.8"
   }
 }
