@@ -8,6 +8,8 @@ import { analyzeTicker, aggregate, loadAll } from './metrics.js';
 const app = express();
 app.use(morgan('tiny'));
 
+console.log('[BOOT] FMP_API_KEY present:', !!process.env.FMP_API_KEY ? 'yes' : 'NO');
+
 const requireKey = (req, res, next) => {
   const expected = process.env.METRICS_KEY;
   if (!expected) return res.status(500).send('METRICS_KEY not set');
@@ -20,6 +22,7 @@ const requireKey = (req, res, next) => {
 app.get('/', (_req, res) => res.type('text').send('ok'));
 
 app.get('/metrics', requireKey, async (_req, res) => {
+  console.log('metrics request');
   try {
     const portfolio = loadAll();
     const rows = [];

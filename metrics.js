@@ -69,34 +69,38 @@ function loadPortfolio() {
 }
 
 /* --------------------------------- FMP IO --------------------------------- */
-async function fmp(path, params = {}) {
+// replace your fmp() with this
+async function fmp(pathOrUrl, params = {}) {
   const apikey = process.env.FMP_API_KEY;
   if (!apikey) throw new Error('FMP_API_KEY missing');
-  const url = `${API}${path}?${qs({ ...params, apikey })}`;
+
+  const isAbs = /^https?:\/\//i.test(pathOrUrl);
+  const base = isAbs ? '' : 'https://financialmodelingprep.com';
+  const url = `${base}${pathOrUrl}${pathOrUrl.includes('?') ? '&' : '?'}${qs({ ...params, apikey })}`;
+
+  const masked = url.replace(/(apikey=)[^&]+/i, '$1***');
   const t0 = Date.now();
-  try {
-    log('debug', 'HTTP → FMP', { path, params: params || {} });
-    const r = await fetch(url);
-    const dur = since(t0);
-    if (!r.ok) {
-      log('error', 'HTTP error from FMP', { path, status: r.status, dur });
-      throw new Error(`FMP ${path} ${r.status}`);
-    }
-    const json = await r.json();
+  log('debug', 'HTTP → FMP', { url: masked });
 
-    // cheap size heuristic
-    let count = 0;
-    if (Array.isArray(json)) count = json.length;
-    else if (json?.historical) count = json.historical.length;
-    else if (json && typeof json === 'object') count = Object.keys(json).length;
+  const r = await fetch(url, { headers: { 'user-agent': 'portfolio-metrics/2.2' } });
+  const body = await r.text();
+  const dur = since(t0);
 
-    log('debug', 'HTTP ← FMP ok', { path, dur, items: count });
-    return json;
-  } catch (e) {
-    log('error', 'FMP request failed', { path, err: e.message });
-    throw e;
+  if (!r.ok) {
+    log('error', 'HTTP error from FMP', { status: r.status, dur, url: masked, body: body.slice(0, 300) });
+    throw new Error(`FMP ${pathOrUrl} ${r.status}`);
   }
+  let json;
+  try { json = JSON.parse(body); }
+  catch { log('error', 'FMP response not JSON', { url: masked, dur, body: body.slice(0, 300) }); throw new Error('FMP response not JSON'); }
+
+  let count = 0;
+  if (Array.isArray(json)) count = json.length;
+  else if (json?.historical) count = json.historical.length;
+  log('debug', 'HTTP ← FMP ok', { url: masked, dur, items: count });
+  return json;
 }
+
 
 // TTL memoizer with logs
 function memoizeTTL(fn, ttlMs, name) {
@@ -119,46 +123,85 @@ function memoizeTTL(fn, ttlMs, name) {
 
 /* ------------------------------- data fetchers ---------------------------- */
 // Quote (current price + name). Endpoint returns an array.
+// replace _fetchQuote
 async function _fetchQuote(ticker) {
-  const arr = await fmp(`/quote/${encodeURIComponent(ticker)}`);
+  const url = `https://financialmodelingprep.com/api/v3/quote/${encodeURIComponent(ticker)}`;
+  const arr = await fmp(url); // fmp() already appends ?apikey=...
   const q = Array.isArray(arr) ? arr[0] : null;
-  const out = {
-    price: toNum(q?.price),
+  return {
+    price: Number(q?.price ?? q?.close ?? null),
     name: q?.name || ticker,
-    currency: q?.currency || '' // FMP may omit; leave blank
+    currency: q?.currency || ''
   };
-  if (out.price == null) log('warn', 'Missing current price', { ticker });
-  return out;
 }
+
 const fetchQuote = memoizeTTL(_fetchQuote, 60_000, 'quote'); // 1 min
 
 // Dividends (for TTM + annual sums)
+// replace _fetchDividends
 async function _fetchDividends(ticker) {
   const from = dayjs().subtract(12, 'year').format('YYYY-MM-DD');
-  const res = await fmp(`/historical-price-full/stock_dividend/${encodeURIComponent(ticker)}`, { from });
-  const hist = res?.historical || [];
-  const list = hist.map(d => ({
-    date: d.date,
-    dividend: toNum(d.adjDividend ?? d.dividend)
-  })).filter(x => x.dividend && x.dividend > 0);
+  const to   = dayjs().format('YYYY-MM-DD');
 
-  if (list.length === 0) log('warn', 'No dividend history', { ticker });
-  return list;
+  // Try FMP stable first (if your plan happens to allow it)
+  const fmpUrl = `https://financialmodelingprep.com/stable/dividends?symbol=${encodeURIComponent(ticker)}&from=${from}&to=${to}`;
+  try {
+    const list = await fmp(fmpUrl);
+    const rows = (Array.isArray(list) ? list : []).map(d => ({
+      date: d.paymentDate || d.exDate || d.date || d.recordDate,
+      dividend: Number(d.adjDividend ?? d.dividend ?? d.amount ?? d.value)
+    })).filter(x => x.date && x.dividend > 0 && dayjs(x.date).isValid());
+    if (rows.length === 0) log('warn','No dividend history (FMP stable)',{ticker});
+    return rows;
+  } catch (e) {
+    log('warn','FMP dividends blocked; falling back to Alpha Vantage',{ticker, err:e.message});
+    return await _fetchDividendsAV(ticker, from, to);
+  }
 }
+
+// Alpha Vantage monthly-adjusted → "7. dividend amount" per month
+async function _fetchDividendsAV(ticker, from, to) {
+  const key = process.env.ALPHA_VANTAGE_KEY;
+  if (!key) throw new Error('ALPHA_VANTAGE_KEY missing (needed for dividends fallback)');
+  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&apikey=${encodeURIComponent(key)}`;
+  const t0 = Date.now();
+  const r = await fetch(url, { headers:{'user-agent':'portfolio-metrics/2.2'} });
+  const body = await r.json();
+  if (body['Note'] || body['Information']) {
+    // rate limited or plan issue
+    throw new Error(`AlphaVantage limit/info: ${body['Note'] || body['Information']}`);
+  }
+  const series = body['Monthly Adjusted Time Series'];
+  if (!series) throw new Error('AlphaVantage missing Monthly Adjusted Time Series');
+
+  // Flatten months to dividend events (use month-end date as event date)
+  const rows = Object.entries(series).map(([date, rec]) => ({
+    date,
+    dividend: Number(rec['7. dividend amount'] || 0)
+  })).filter(x => x.dividend > 0 && dayjs(x.date).isAfter(dayjs(from).subtract(1,'day')) && dayjs(x.date).isBefore(dayjs(to).add(1,'day')));
+
+  log('debug','AlphaVantage dividends fetched',{ticker, months: rows.length, dur: since(t0)});
+  return rows;
+}
+
 const fetchDividends = memoizeTTL(_fetchDividends, 12 * 60 * 60_000, 'dividends'); // 12h
 
 // Start price: first adjClose on/after START_DATE
+// replace _fetchStartPrice
 async function _fetchStartPrice(ticker) {
   const from = START_DATE.subtract(10, 'day').format('YYYY-MM-DD');
-  const to = START_DATE.add(20, 'day').format('YYYY-MM-DD');
-  const res = await fmp(`/historical-price-full/${encodeURIComponent(ticker)}`, { from, to, serietype: 'line' });
-  const hist = res?.historical || [];
-  hist.sort((a, b) => new Date(a.date) - new Date(b.date));
-  const bar = hist.find(b => dayjs(b.date).isSame(START_DATE, 'day') || dayjs(b.date).isAfter(START_DATE));
-  const px = toNum(bar?.adjClose ?? bar?.close ?? null);
-  if (px == null) log('warn', 'Start price not found near START_DATE', { ticker, from, to });
+  const to   = START_DATE.add(20, 'day').format('YYYY-MM-DD');
+  const url  = `https://financialmodelingprep.com/api/v3/historical-price-full/${encodeURIComponent(ticker)}?from=${from}&to=${to}&serietype=line`;
+  const res  = await fmp(url);
+  const hist = res?.historical || res || [];
+  hist.sort((a,b) => new Date(a.date) - new Date(b.date));
+  const b = hist.find(x => dayjs(x.date).isSame(START_DATE, 'day') || dayjs(x.date).isAfter(START_DATE));
+  const px = Number(b?.adjClose ?? b?.close ?? null);
+  if (px == null) log('warn','Start price not found near START_DATE',{ticker, from, to, sample:b});
   return px;
 }
+
+
 const fetchStartPrice = memoizeTTL(_fetchStartPrice, 30 * 24 * 60 * 60_000, 'startPrice'); // 30d
 
 /* ------------------------------ calculations ------------------------------ */
