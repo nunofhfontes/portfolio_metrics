@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import morgan from 'morgan';
 import dayjs from 'dayjs';
+import { fetch } from 'undici';
 import { analyzeTicker, aggregate, loadAll } from './metrics.js';
 
 const app = express();
@@ -43,7 +44,8 @@ app.get('/metrics', requireKey, async (_req, res) => {
 
 app.get('/metrics.html', requireKey, async (_req, res) => {
   try {
-    const r = await fetch(`http://localhost:${process.env.PORT || 3000}/metrics?key=${process.env.METRICS_KEY}`).then(x => x.json());
+    const base = `http://localhost:${process.env.PORT || 3000}`;
+    const r = await fetch(`${base}/metrics?key=${encodeURIComponent(process.env.METRICS_KEY)}`).then(x => x.json());
     const fmtPct = (x) => (x == null ? '-' : (x * 100).toFixed(2) + '%');
     const fmt = (x, d=2) => (x == null ? '-' : x.toFixed(d));
     const rows = r.perTicker.filter(x => !x.error);
