@@ -1,13 +1,28 @@
-import yf from 'yahoo-finance2';
 import dayjs from 'dayjs';
+import { fetch } from 'undici';
 
+const API = 'https://financialmodelingprep.com/api/v3';
 const START_DATE = dayjs(process.env.START_DATE || '2023-01-01');
 
 const toNum = (x) => (x == null || Number.isNaN(Number(x)) ? null : Number(x));
 const safeDiv = (a, b) => (b === 0 ? null : a / b);
 const lastFullCalendarYear = () => dayjs().year() - 1;
 
-// tiny in-memory caches to avoid hammering Yahoo on every hit
+function qs(params) {
+  const u = new URLSearchParams(params);
+  return u.toString();
+}
+
+async function fmp(path, params = {}) {
+  const apikey = process.env.FMP_API_KEY;
+  if (!apikey) throw new Error('FMP_API_KEY missing');
+  const url = `${API}${path}?${qs({ ...params, apikey })}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`FMP ${path} ${r.status}`);
+  return r.json();
+}
+
+// tiny TTL memoizer to reduce calls
 function memoizeTTL(fn, ttlMs) {
   const cache = new Map();
   return async (key) => {
@@ -35,33 +50,46 @@ function loadPortfolio() {
   return entries;
 }
 
+/** ---------- FMP fetchers ---------- **/
+
+// Quote (current price + name). Endpoint returns an array.
 async function _fetchQuote(ticker) {
-  const q = await yf.quote(ticker);
+  const arr = await fmp(`/quote/${encodeURIComponent(ticker)}`);
+  const q = Array.isArray(arr) ? arr[0] : null;
   return {
-    price: toNum(q.regularMarketPrice ?? q.postMarketPrice ?? q.preMarketPrice ?? q.ask ?? q.bid),
-    currency: q.currency || q.financialCurrency || null,
-    name: q.shortName || q.longName || ticker
+    price: toNum(q?.price),
+    name: q?.name || ticker,
+    currency: q?.currency || '' // FMP may omit; leave blank
   };
 }
-const fetchQuote = memoizeTTL(_fetchQuote, 60_000);                     // 1 min
+const fetchQuote = memoizeTTL(_fetchQuote, 60_000); // 1 min
 
+// Dividends history (for TTM + annual sums). Use adjDividend when available.
 async function _fetchDividends(ticker) {
-  const start = dayjs().subtract(12, 'year').toDate();
-  const res = await yf.historical(ticker, { period1: start, events: 'dividends' });
-  return res.filter(r => r.dividends != null);
+  const from = dayjs().subtract(12, 'year').format('YYYY-MM-DD');
+  const res = await fmp(`/historical-price-full/stock_dividend/${encodeURIComponent(ticker)}`, { from });
+  const hist = res?.historical || [];
+  return hist.map(d => ({
+    date: d.date,
+    dividend: toNum(d.adjDividend ?? d.dividend) // use adjusted
+  })).filter(x => x.dividend && x.dividend > 0);
 }
-const fetchDividends = memoizeTTL(_fetchDividends, 12 * 60 * 60_000);   // 12h
+const fetchDividends = memoizeTTL(_fetchDividends, 12 * 60 * 60_000); // 12h
 
+// Start price: first adjClose on/after START_DATE
 async function _fetchStartPrice(ticker) {
-  const period1 = START_DATE.subtract(10, 'day').toDate();
-  const period2 = START_DATE.add(20, 'day').toDate();
-  const hist = await yf.historical(ticker, { period1, period2, interval: '1d' });
-  const startBar = hist
-    .sort((a, b) => new Date(a.date) - new Date(b.date))
-    .find(b => dayjs(b.date).isSame(START_DATE, 'day') || dayjs(b.date).isAfter(START_DATE));
-  return startBar?.adjClose ?? null;
+  const from = START_DATE.subtract(10, 'day').format('YYYY-MM-DD');
+  const to = START_DATE.add(20, 'day').format('YYYY-MM-DD');
+  const res = await fmp(`/historical-price-full/${encodeURIComponent(ticker)}`, { from, to, serietype: 'line' });
+  const hist = res?.historical || [];
+  // FMP historical objects typically: { date, close, adjClose }
+  hist.sort((a, b) => new Date(a.date) - new Date(b.date));
+  const bar = hist.find(b => dayjs(b.date).isSame(START_DATE, 'day') || dayjs(b.date).isAfter(START_DATE));
+  return toNum(bar?.adjClose ?? bar?.close ?? null);
 }
 const fetchStartPrice = memoizeTTL(_fetchStartPrice, 30 * 24 * 60 * 60_000); // 30d
+
+/** ---------- Calculations ---------- **/
 
 function analyzeDividends(divEvents) {
   const byYear = {};
@@ -72,7 +100,7 @@ function analyzeDividends(divEvents) {
   for (const ev of divEvents) {
     const d = dayjs(ev.date);
     const y = d.year();
-    const amt = toNum(ev.dividends);
+    const amt = toNum(ev.dividend);
     if (!amt || amt <= 0) continue;
     byYear[y] = (byYear[y] || 0) + amt;
     if (d.isAfter(ttmStart)) ttmDivPS += amt;
@@ -89,13 +117,13 @@ function dgr(byYear, n) {
 }
 
 export async function analyzeTicker(t) {
-  const [quote, divs, startPx] = await Promise.all([
+  const [quote, dividends, startPx] = await Promise.all([
     fetchQuote(t.ticker),
     fetchDividends(t.ticker),
     fetchStartPrice(t.ticker)
   ]);
 
-  const { byYear, ttmDivPS } = analyzeDividends(divs);
+  const { byYear, ttmDivPS } = analyzeDividends(dividends);
   const currPx = quote.price;
   const mv = currPx != null ? currPx * t.shares : null;
 
@@ -112,7 +140,7 @@ export async function analyzeTicker(t) {
     priceReturnPct = (currPx - startPx) / startPx;
   }
 
-  const annualDivIncome = ttmDivPS * t.shares;
+  const annualDivIncome = (ttmDivPS ?? 0) * t.shares;
   const monthlyDivIncome = annualDivIncome / 12;
 
   return {
@@ -142,7 +170,7 @@ export function aggregate(rows) {
     marketValue: 0,
     pricePnL: 0,
     annualDivIncome: 0,
-    startValue: 0 // sum(shares * startPrice) for portfolio-level % since START_DATE
+    startValue: 0
   };
   for (const r of rows) {
     totals.marketValue += r.marketValue ?? 0;
@@ -156,6 +184,5 @@ export function aggregate(rows) {
 }
 
 export function loadAll() {
-  const portfolio = loadPortfolio();
-  return portfolio;
+  return loadPortfolio();
 }
