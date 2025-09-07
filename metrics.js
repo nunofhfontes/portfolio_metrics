@@ -1,57 +1,34 @@
+// metrics.js — Alpha Vantage only
 import dayjs from 'dayjs';
 import { fetch } from 'undici';
 
-const API = 'https://financialmodelingprep.com/api/v3';
 const START_DATE = dayjs(process.env.START_DATE || '2023-01-01');
 
 /* ----------------------------- logging utils ----------------------------- */
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
 const CUR_LEVEL = LEVELS[LOG_LEVEL] ?? LEVELS.info;
-
-function log(level, msg, meta) {
-  const lvl = LEVELS[level] ?? LEVELS.info;
-  if (lvl < CUR_LEVEL) return;
+const log = (lvl, msg, meta) => {
+  const L = LEVELS[lvl] ?? LEVELS.info;
+  if (L < CUR_LEVEL) return;
   const ts = new Date().toISOString();
-  const line = `[${ts}] [${level.toUpperCase()}] ${msg}`;
-  if (meta === undefined) {
-    // eslint-disable-next-line no-console
-    console.log(line);
-  } else {
-    // eslint-disable-next-line no-console
-    console.log(line, safeMeta(meta));
-  }
-}
+  // eslint-disable-next-line no-console
+  console.log(`[${ts}] [${lvl.toUpperCase()}] ${msg}`, meta ? safeMeta(meta) : '');
+};
+const safeMeta = (m) => {
+  try { return JSON.parse(JSON.stringify(m, (_, v) => (typeof v === 'string' && v.length > 300 ? v.slice(0, 300) + '…' : v))); }
+  catch { return m; }
+};
+const since = (t0) => {
+  const ms = Date.now() - t0;
+  return ms < 1000 ? `${ms}ms` : `${(ms/1000).toFixed(2)}s`;
+};
 
-function safeMeta(m) {
-  try {
-    // keep logs compact; avoid huge payloads
-    return JSON.parse(JSON.stringify(m, (_, v) =>
-      typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '…' : v
-    ));
-  } catch {
-    return m;
-  }
-}
-
-function since(startMs) {
-  const ms = Date.now() - startMs;
-  if (ms < 1000) return `${ms}ms`;
-  const s = (ms / 1000).toFixed(2);
-  return `${s}s`;
-}
-
-/* --------------------------------- helpers -------------------------------- */
+/* -------------------------------- helpers -------------------------------- */
 const toNum = (x) => (x == null || Number.isNaN(Number(x)) ? null : Number(x));
 const safeDiv = (a, b) => (b === 0 ? null : a / b);
 const lastFullCalendarYear = () => dayjs().year() - 1;
 
-function qs(params) {
-  const u = new URLSearchParams(params);
-  return u.toString();
-}
-
-/* ----------------------------- portfolio load ----------------------------- */
 function loadPortfolio() {
   const raw = process.env.PORTFOLIO_JSON;
   if (!raw) throw new Error('PORTFOLIO_JSON missing');
@@ -64,50 +41,45 @@ function loadPortfolio() {
     return { ticker, shares, avgPrice };
   });
   if (!entries.length) throw new Error('Empty portfolio');
-  log('info', 'Loaded portfolio', { tickers: entries.map(e => e.ticker), count: entries.length });
+  log('info', 'Loaded portfolio', { count: entries.length, tickers: entries.map(e => e.ticker) });
   return entries;
 }
 
-/* --------------------------------- FMP IO --------------------------------- */
-// replace your fmp() with this
-async function fmp(pathOrUrl, params = {}) {
-  const apikey = process.env.FMP_API_KEY;
-  if (!apikey) throw new Error('FMP_API_KEY missing');
-
-  const isAbs = /^https?:\/\//i.test(pathOrUrl);
-  const base = isAbs ? '' : 'https://financialmodelingprep.com';
-  const url = `${base}${pathOrUrl}${pathOrUrl.includes('?') ? '&' : '?'}${qs({ ...params, apikey })}`;
-
+/* -------------------------------- AlphaVantage IO ------------------------------- */
+// Build and call AV query; log masked URL; surface error bodies/rate limits
+async function av(params) {
+  const key = process.env.ALPHA_VANTAGE_KEY;
+  if (!key) throw new Error('ALPHA_VANTAGE_KEY missing');
+  const url = `https://www.alphavantage.co/query?${new URLSearchParams({ ...params, apikey: key })}`;
   const masked = url.replace(/(apikey=)[^&]+/i, '$1***');
   const t0 = Date.now();
-  log('debug', 'HTTP → FMP', { url: masked });
+  log('debug', 'HTTP → AV', { url: masked });
 
-  const r = await fetch(url, { headers: { 'user-agent': 'portfolio-metrics/2.2' } });
-  const body = await r.text();
+  const resp = await fetch(url, { headers: { 'user-agent': 'portfolio-metrics/av-1.0' } });
+  const body = await resp.text();
   const dur = since(t0);
 
-  if (!r.ok) {
-    log('error', 'HTTP error from FMP', { status: r.status, dur, url: masked, body: body.slice(0, 300) });
-    throw new Error(`FMP ${pathOrUrl} ${r.status}`);
+  if (!resp.ok) {
+    log('error', 'HTTP error from AV', { status: resp.status, dur, url: masked, body: body.slice(0, 300) });
+    throw new Error(`AV ${params.function} ${resp.status}`);
   }
-  let json;
-  try { json = JSON.parse(body); }
-  catch { log('error', 'FMP response not JSON', { url: masked, dur, body: body.slice(0, 300) }); throw new Error('FMP response not JSON'); }
-
-  let count = 0;
-  if (Array.isArray(json)) count = json.length;
-  else if (json?.historical) count = json.historical.length;
-  log('debug', 'HTTP ← FMP ok', { url: masked, dur, items: count });
+  let json; try { json = JSON.parse(body); } catch {
+    log('error', 'AV response not JSON', { url: masked, dur, body: body.slice(0, 300) });
+    throw new Error('AV response not JSON');
+  }
+  if (json.Note || json.Information || json['Error Message']) {
+    log('error', 'AV API message', { url: masked, dur, note: json.Note, info: json.Information, err: json['Error Message'] });
+    throw new Error(json.Note || json.Information || json['Error Message'] || 'AV error');
+  }
+  log('debug', 'HTTP ← AV ok', { url: masked, dur });
   return json;
 }
 
-
-// TTL memoizer with logs
+// tiny TTL memo
 function memoizeTTL(fn, ttlMs, name) {
   const cache = new Map();
   return async (key) => {
-    const now = Date.now();
-    const c = cache.get(key);
+    const c = cache.get(key), now = Date.now();
     if (c && (now - c.t) < ttlMs) {
       log('debug', `${name} cache HIT`, { key, ageMs: now - c.t });
       return c.v;
@@ -121,112 +93,140 @@ function memoizeTTL(fn, ttlMs, name) {
   };
 }
 
-/* ------------------------------- data fetchers ---------------------------- */
-// Quote (current price + name). Endpoint returns an array.
-// replace _fetchQuote
-async function _fetchQuote(ticker) {
-  const url = `https://financialmodelingprep.com/api/v3/quote/${encodeURIComponent(ticker)}`;
-  const arr = await fmp(url); // fmp() already appends ?apikey=...
-  const q = Array.isArray(arr) ? arr[0] : null;
-  return {
-    price: Number(q?.price ?? q?.close ?? null),
-    name: q?.name || ticker,
-    currency: q?.currency || ''
-  };
-}
+/* --------------------------- Symbol normalization --------------------------- */
+// Heuristics for TSX/TSXV & hyphen/dot quirks (e.g., "SRU-UN.TO")
+function avSymbolVariants(ticker) {
+  const variants = new Set([ticker]);
 
-const fetchQuote = memoizeTTL(_fetchQuote, 60_000, 'quote'); // 1 min
+  // Yahoo TSX -> AV TSX sample in docs uses ".TRT" for TSX, ".TRV" for TSXV
+  // https://www.alphavantage.co/documentation/ (e.g. SHOP.TRT) :contentReference[oaicite:1]{index=1}
+  if (ticker.endsWith('.TO')) variants.add(ticker.replace(/\.TO$/, '.TRT'));
+  if (ticker.endsWith('.V')) variants.add(ticker.replace(/\.V$/, '.TRV'));
 
-// Dividends (for TTM + annual sums)
-// replace _fetchDividends
-async function _fetchDividends(ticker) {
-  const from = dayjs().subtract(12, 'year').format('YYYY-MM-DD');
-  const to   = dayjs().format('YYYY-MM-DD');
-
-  // Try FMP stable first (if your plan happens to allow it)
-  const fmpUrl = `https://financialmodelingprep.com/stable/dividends?symbol=${encodeURIComponent(ticker)}&from=${from}&to=${to}`;
-  try {
-    const list = await fmp(fmpUrl);
-    const rows = (Array.isArray(list) ? list : []).map(d => ({
-      date: d.paymentDate || d.exDate || d.date || d.recordDate,
-      dividend: Number(d.adjDividend ?? d.dividend ?? d.amount ?? d.value)
-    })).filter(x => x.date && x.dividend > 0 && dayjs(x.date).isValid());
-    if (rows.length === 0) log('warn','No dividend history (FMP stable)',{ticker});
-    return rows;
-  } catch (e) {
-    log('warn','FMP dividends blocked; falling back to Alpha Vantage',{ticker, err:e.message});
-    return await _fetchDividendsAV(ticker, from, to);
-  }
-}
-
-// Alpha Vantage monthly-adjusted → "7. dividend amount" per month
-async function _fetchDividendsAV(ticker, from, to) {
-  const key = process.env.ALPHA_VANTAGE_KEY;
-  if (!key) throw new Error('ALPHA_VANTAGE_KEY missing (needed for dividends fallback)');
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY_ADJUSTED&symbol=${encodeURIComponent(ticker)}&apikey=${encodeURIComponent(key)}`;
-  const t0 = Date.now();
-  const r = await fetch(url, { headers:{'user-agent':'portfolio-metrics/2.2'} });
-  const body = await r.json();
-  if (body['Note'] || body['Information']) {
-    // rate limited or plan issue
-    throw new Error(`AlphaVantage limit/info: ${body['Note'] || body['Information']}`);
-  }
-  const series = body['Monthly Adjusted Time Series'];
-  if (!series) throw new Error('AlphaVantage missing Monthly Adjusted Time Series');
-
-  // Flatten months to dividend events (use month-end date as event date)
-  const rows = Object.entries(series).map(([date, rec]) => ({
-    date,
-    dividend: Number(rec['7. dividend amount'] || 0)
-  })).filter(x => x.dividend > 0 && dayjs(x.date).isAfter(dayjs(from).subtract(1,'day')) && dayjs(x.date).isBefore(dayjs(to).add(1,'day')));
-
-  log('debug','AlphaVantage dividends fetched',{ticker, months: rows.length, dur: since(t0)});
-  return rows;
-}
-
-const fetchDividends = memoizeTTL(_fetchDividends, 12 * 60 * 60_000, 'dividends'); // 12h
-
-// Start price: first adjClose on/after START_DATE
-// replace _fetchStartPrice
-async function _fetchStartPrice(ticker) {
-  const from = START_DATE.subtract(10, 'day').format('YYYY-MM-DD');
-  const to   = START_DATE.add(20, 'day').format('YYYY-MM-DD');
-  const url  = `https://financialmodelingprep.com/api/v3/historical-price-full/${encodeURIComponent(ticker)}?from=${from}&to=${to}&serietype=line`;
-  const res  = await fmp(url);
-  const hist = res?.historical || res || [];
-  hist.sort((a,b) => new Date(a.date) - new Date(b.date));
-  const b = hist.find(x => dayjs(x.date).isSame(START_DATE, 'day') || dayjs(x.date).isAfter(START_DATE));
-  const px = Number(b?.adjClose ?? b?.close ?? null);
-  if (px == null) log('warn','Start price not found near START_DATE',{ticker, from, to, sample:b});
-  return px;
-}
-
-
-const fetchStartPrice = memoizeTTL(_fetchStartPrice, 30 * 24 * 60 * 60_000, 'startPrice'); // 30d
-
-/* ------------------------------ calculations ------------------------------ */
-function analyzeDividends(divEvents, ticker) {
-  const byYear = {};
-  const now = dayjs();
-  const ttmStart = now.subtract(365, 'day');
-  let ttmDivPS = 0;
-
-  for (const ev of divEvents) {
-    const d = dayjs(ev.date);
-    const y = d.year();
-    const amt = toNum(ev.dividend);
-    if (!amt || amt <= 0) continue;
-    byYear[y] = (byYear[y] || 0) + amt;
-    if (d.isAfter(ttmStart)) ttmDivPS += amt;
-  }
-
-  log('debug', 'Div analysis', {
-    ticker,
-    years: Object.keys(byYear).length,
-    ttmDivPS
+  // Hyphen vs dot between root and "UN", "PR", etc.
+  // Try replacing one hyphen with dot before the suffix, e.g., SRU-UN.TO -> SRU.UN.TRT
+  variants.forEach(s => {
+    const m = s.match(/^([A-Z0-9]+)-([A-Z0-9]+)\.(TRT|TRV)$/i);
+    if (m) variants.add(`${m[1]}.${m[2]}.${m[3]}`.toUpperCase());
   });
 
-  return { byYear, ttmDivPS };
+  return [...variants];
+}
+
+/* ------------------------------ Core fetchers ------------------------------ */
+// Try DAILY_ADJUSTED first (best: adjusted close + dividends). Fallback to DAILY + MONTHLY_ADJUSTED.
+async function _fetchDailyBundle(originalTicker) {
+  const tries = avSymbolVariants(originalTicker);
+  let lastErr;
+
+  for (const symbol of tries) {
+    // 1) Try DAILY_ADJUSTED (full)
+    try {
+      const dj = await av({
+        function: 'TIME_SERIES_DAILY_ADJUSTED',
+        symbol,
+        outputsize: 'full'
+      }); // docs: fields incl. "5. adjusted close" and "7. dividend amount" :contentReference[oaicite:2]{index=2}
+
+      const series = dj['Time Series (Daily)'];
+      if (!series) throw new Error('No daily adjusted series');
+
+      return { symbol, series, adjusted: true };
+    } catch (e) {
+      lastErr = e;
+      log('warn', 'DAILY_ADJUSTED failed, will try DAILY', { ticker: originalTicker, symbol, err: e.message });
+      // 2) Try DAILY (prices only)
+      try {
+        const d = await av({
+          function: 'TIME_SERIES_DAILY',
+          symbol,
+          outputsize: 'full'
+        }); // docs: daily (raw OHLCV) :contentReference[oaicite:3]{index=3}
+        const series = d['Time Series (Daily)'];
+        if (!series) throw new Error('No daily series');
+        return { symbol, series, adjusted: false };
+      } catch (e2) {
+        lastErr = e2;
+        log('warn', 'DAILY failed on this symbol variant', { ticker: originalTicker, symbol, err: e2.message });
+      }
+    }
+  }
+  throw lastErr || new Error('Unable to fetch daily series');
+}
+const fetchDailyBundle = memoizeTTL(_fetchDailyBundle, 6 * 60 * 60_000, 'daily'); // 6h
+
+// If DAILY_ADJUSTED unavailable, fetch monthly-adjusted just for dividends
+async function _fetchMonthlyAdjusted(originalTicker) {
+  const tries = avSymbolVariants(originalTicker);
+  let lastErr;
+  for (const symbol of tries) {
+    try {
+      const mj = await av({
+        function: 'TIME_SERIES_MONTHLY_ADJUSTED',
+        symbol
+      }); // docs: contains "7. dividend amount" per month :contentReference[oaicite:4]{index=4}
+      const series = mj['Monthly Adjusted Time Series'];
+      if (!series) throw new Error('No monthly adjusted series');
+      return { symbol, series };
+    } catch (e) {
+      lastErr = e;
+      log('warn', 'MONTHLY_ADJUSTED failed on this variant', { ticker: originalTicker, err: e.message });
+    }
+  }
+  throw lastErr || new Error('Unable to fetch monthly adjusted series');
+}
+const fetchMonthlyAdjusted = memoizeTTL(_fetchMonthlyAdjusted, 24 * 60 * 60_000, 'monthly'); // 24h
+
+/* ------------------------------ Calculations ------------------------------ */
+function analyzeFromDaily(daily, adjusted) {
+  // daily: object { 'YYYY-MM-DD': { '4. close': '...', '5. adjusted close': '...', '7. dividend amount': '...' } }
+  const rows = Object.entries(daily)
+    .map(([date, rec]) => ({
+      date,
+      close: toNum(rec['4. close']),
+      adjClose: toNum(rec['5. adjusted close']),
+      div: toNum(rec['7. dividend amount'])
+    }))
+    .filter(x => dayjs(x.date).isValid())
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  // Current price = last adjClose if adjusted, else last close
+  const last = rows[rows.length - 1];
+  const currentPrice = adjusted ? last?.adjClose : last?.close;
+
+  // Start price = first bar on/after START_DATE
+  const startRow = rows.find(r => dayjs(r.date).isSame(START_DATE, 'day') || dayjs(r.date).isAfter(START_DATE));
+  const startPrice = adjusted ? startRow?.adjClose : startRow?.close;
+
+  // Dividends (daily events from DAILY_ADJUSTED only)
+  let byYear = {}, ttm = 0;
+  if (adjusted) {
+    const ttmStart = dayjs().subtract(365, 'day');
+    for (const r of rows) {
+      if (r.div && r.div > 0) {
+        const y = dayjs(r.date).year();
+        byYear[y] = (byYear[y] || 0) + r.div;
+        if (dayjs(r.date).isAfter(ttmStart)) ttm += r.div;
+      }
+    }
+  }
+
+  return { currentPrice, startPrice, byYear, ttmDivPS: adjusted ? ttm : null };
+}
+
+function analyzeFromMonthly(monthlySeries) {
+  const rows = Object.entries(monthlySeries)
+    .map(([date, rec]) => ({ date, div: toNum(rec['7. dividend amount']) }))
+    .filter(x => dayjs(x.date).isValid() && x.div && x.div > 0);
+
+  const ttmStart = dayjs().subtract(365, 'day');
+  let byYear = {}, ttm = 0;
+  for (const r of rows) {
+    const y = dayjs(r.date).year();
+    byYear[y] = (byYear[y] || 0) + r.div;
+    if (dayjs(r.date).isAfter(ttmStart)) ttm += r.div;
+  }
+  return { byYear, ttmDivPS: ttm };
 }
 
 function dgr(byYear, n, ticker) {
@@ -245,43 +245,51 @@ export async function analyzeTicker(t) {
   const t0 = Date.now();
   log('info', 'Analyze ticker start', { ticker: t.ticker });
 
-  const [quote, dividends, startPx] = await Promise.all([
-    fetchQuote(t.ticker),
-    fetchDividends(t.ticker),
-    fetchStartPrice(t.ticker)
-  ]);
+  // 1) Daily (adjusted preferred)
+  const daily = await fetchDailyBundle(t.ticker);
+  const { currentPrice, startPrice, byYear: byYearDaily, ttmDivPS: ttmDaily } =
+    analyzeFromDaily(daily.series, daily.adjusted);
 
-  const { byYear, ttmDivPS } = analyzeDividends(dividends, t.ticker);
-  const currPx = quote.price;
+  // 2) Dividends: if daily.adjusted gave us dividends, use them. Otherwise monthly-adjusted.
+  let byYear = byYearDaily, ttmDivPS = ttmDaily;
+  if (!ttmDivPS) {
+    log('warn', 'No dividends from daily; using monthly-adjusted', { ticker: t.ticker });
+    const monthly = await fetchMonthlyAdjusted(t.ticker);
+    const m = analyzeFromMonthly(monthly.series);
+    byYear = m.byYear;
+    ttmDivPS = m.ttmDivPS;
+  }
+
+  // 3) Compute metrics
+  const currPx = currentPrice;
   const mv = currPx != null ? currPx * t.shares : null;
-
   const currentYield = currPx != null ? safeDiv(ttmDivPS, currPx) : null;
   const yieldOnCost = safeDiv(ttmDivPS, t.avgPrice);
 
-  const dgr3 = dgr(byYear, 3, t.ticker);
-  const dgr5 = dgr(byYear, 5, t.ticker);
-  const dgr10 = dgr(byYear, 10, t.ticker);
-
   let priceReturnAbs = null, priceReturnPct = null;
-  if (currPx != null && startPx != null && startPx > 0) {
-    priceReturnAbs = (currPx - startPx) * t.shares;
-    priceReturnPct = (currPx - startPx) / startPx;
-  } else {
-    if (currPx == null) log('warn', 'Skipping price return (no currPx)', { ticker: t.ticker });
-    if (startPx == null) log('warn', 'Skipping price return (no startPx)', { ticker: t.ticker });
+  if (currPx != null && startPrice != null && startPrice > 0) {
+    priceReturnAbs = (currPx - startPrice) * t.shares;
+    priceReturnPct = (currPx - startPrice) / startPrice;
+  } else if (!daily.adjusted) {
+    log('warn', 'Price return based on RAW daily (split risk)', { ticker: t.ticker });
   }
 
   const annualDivIncome = (ttmDivPS ?? 0) * t.shares;
   const monthlyDivIncome = annualDivIncome / 12;
 
+  // DGRs
+  const dgr3 = dgr(byYear, 3, t.ticker);
+  const dgr5 = dgr(byYear, 5, t.ticker);
+  const dgr10 = dgr(byYear, 10, t.ticker);
+
   const row = {
     ticker: t.ticker,
-    name: quote.name,
-    currency: quote.currency,
+    name: t.ticker,           // AV time series don’t carry names; leave ticker
+    currency: '',             // AV doesn’t return currency here
     shares: t.shares,
     avgPrice: t.avgPrice,
     currentPrice: currPx,
-    startPrice: startPx,
+    startPrice,
     marketValue: mv,
     ttmDivPS,
     currentYield,
@@ -296,15 +304,8 @@ export async function analyzeTicker(t) {
   log('info', 'Analyze ticker done', {
     ticker: t.ticker,
     dur: since(t0),
-    snapshot: {
-      currPx,
-      startPx,
-      ttmDivPS,
-      currentYield,
-      yieldOnCost,
-      priceReturnPct,
-      annualDivIncome
-    }
+    adjustedDaily: daily.adjusted,
+    snapshot: { currPx, startPrice, ttmDivPS, currentYield, priceReturnPct }
   });
 
   return row;
@@ -313,7 +314,7 @@ export async function analyzeTicker(t) {
 export function aggregate(rows) {
   const t0 = Date.now();
   const totals = {
-    currency: rows.find(r => r.currency)?.currency || '',
+    currency: '', // unknown from AV time series
     tickers: rows.length,
     marketValue: 0,
     pricePnL: 0,
